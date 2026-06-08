@@ -6,6 +6,7 @@ let
   inherit (lib)
     concatStringsSep
     escapeShellArg
+    elem
     filterAttrs
     hasPrefix
     literalExpression
@@ -100,8 +101,6 @@ let
     AWL_DATA_DIR = cfg.dataDir;
   } // cfg.environment;
 
-  environment = mapAttrsToList (name: value: "${name}=${toString value}") environmentAttrs;
-
   envExports = concatStringsSep "\n" (mapAttrsToList
     (name: value: "export ${name}=${escapeShellArg (toString value)}")
     environmentAttrs);
@@ -109,8 +108,31 @@ let
   awlPath = makeBinPath ([ ifconfigShim ] ++ cfg.extraPackages);
 
   cliWrapper = pkgs.writeShellScriptBin "awl" ''
+    set -eu
+
     ${envExports}
     export PATH=${escapeShellArg awlPath}:$PATH
+
+    if [ "$(${pkgs.coreutils}/bin/id -u)" -ne 0 ]; then
+      echo "This NixOS AWL wrapper uses ${cfg.dataDir}, which is service-owned." >&2
+      echo "Run CLI commands as root, for example: sudo awl cli me status" >&2
+      echo "Manage the daemon with systemctl, for example: sudo systemctl restart awl" >&2
+      exit 1
+    fi
+
+    if ${pkgs.systemd}/bin/systemctl is-active --quiet awl 2>/dev/null; then
+      case "''${1:-}" in
+        cli|--help|-h|version|--version)
+          ;;
+        *)
+          echo "awl.service is already running; refusing to start a second AWL daemon." >&2
+          echo "Use: sudo systemctl restart awl" >&2
+          echo "For manual daemon debugging: sudo systemctl stop awl && sudo awl" >&2
+          exit 1
+          ;;
+      esac
+    fi
+
     exec ${cfg.package}/bin/awl "$@"
   '';
 
@@ -118,6 +140,14 @@ let
     set -eu
 
     install -d -m 0700 -o ${escapeShellArg cfg.user} -g ${escapeShellArg cfg.group} ${dataDirArg}
+
+    # Repair ownership from previous runs, manual invocations, or older module
+    # versions. AWL rewrites config_awl.json at runtime, and non-root AWL also
+    # tries to chown its config paths to its own UID. The service account must
+    # therefore own the whole state directory before AWL starts.
+    chown -R ${escapeShellArg cfg.user}:${escapeShellArg cfg.group} ${dataDirArg}
+    find ${dataDirArg} -type d -exec chmod 0700 {} +
+    find ${dataDirArg} -type f -exec chmod 0600 {} +
 
     ${optionalString hasConfigSource ''
       if [ ${if cfg.replaceConfig then "1" else "0"} -eq 1 ] || [ ! -s ${configTargetArg} ]; then
@@ -401,8 +431,9 @@ in
       default = true;
       description = ''
         Add a NixOS-aware awl wrapper to environment.systemPackages for CLI
-        usage. The wrapper points the CLI at the service config directory and
-        includes the service-local ifconfig compatibility shim.
+        usage. The wrapper points root-invoked CLI commands at the service
+        config directory, includes the service-local ifconfig compatibility
+        shim, and refuses to start a second daemon while awl.service is active.
       '';
     };
 
@@ -493,6 +524,18 @@ in
           message = "services.awl.dataDir must be an absolute path.";
         }
         {
+          assertion = cfg.user == "root" || elem "CAP_CHOWN" cfg.capabilities;
+          message = "services.awl: non-root AWL needs CAP_CHOWN because upstream AWL tries to chown its config directory and config file.";
+        }
+        {
+          assertion = cfg.user == "root" || elem "CAP_NET_ADMIN" cfg.capabilities;
+          message = "services.awl: non-root AWL needs CAP_NET_ADMIN to create/manage the TUN interface.";
+        }
+        {
+          assertion = cfg.user == "root" || elem "CAP_NET_BIND_SERVICE" cfg.capabilities;
+          message = "services.awl: non-root AWL needs CAP_NET_BIND_SERVICE for the default admin HTTP/DNS listeners on privileged ports.";
+        }
+        {
           assertion = !(hasDeclarativePeers && cfg.settings ? knownPeers);
           message = "services.awl: use services.awl.peers or services.awl.settings.knownPeers, not both.";
         }
@@ -535,6 +578,7 @@ in
         wants = [ "network-online.target" "nss-lookup.target" ];
         after = [ "network-online.target" "nss-lookup.target" ];
         path = [ ifconfigShim ] ++ cfg.extraPackages;
+        environment = environmentAttrs;
 
         serviceConfig = mkMerge [
           ({
@@ -542,7 +586,6 @@ in
             ExecStartPre = "+${preStartScript}";
             ExecStart = "${cfg.package}/bin/awl";
             WorkingDirectory = cfg.dataDir;
-            Environment = environment;
             Restart = "always";
             RestartSec = "5s";
             LimitNOFILE = cfg.limitNOFILE;
